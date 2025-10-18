@@ -1,0 +1,46 @@
+Autonomous AprilTag Seeker Drone
+
+This project contains the Python code to control a drone for a fully autonomous mission:
+Detect a "drop" from a mothership.
+Stabilize and activate its camera.
+Search for a designated AprilTag.
+Navigate towards the tag using visual feedback.
+Land precisely on the tag.
+Project Structure
+main_controller.py: The main script and state machine for the mission. This is the file you run.
+vision_system.py: Handles all camera interactions and AprilTag detection.
+vehicle_control.py: Contains functions for sending movement commands to the drone.
+mock_vehicle.py: A simulated flight controller for testing without hardware.
+requirements.txt: A list of all necessary Python libraries.
+Setup
+Create a virtual environment:
+python3 -m venv venv
+
+
+
+Activate it:
+source venv/bin/activate
+
+
+
+Install the required libraries:
+pip install -r requirements.txt
+
+
+
+Running the Simulation
+To run the mission in simulation mode (no flight controller needed), simply execute the main script:
+python3 main_controller.py
+
+
+
+Switching to the Real Drone
+Connect your Raspberry Pi to the SpeedyBee F405 AIO's UART port.
+Configure the corresponding SERIALx port in ArduPilot with SERIALx_PROTOCOL = 2 (MAVLink 2) and SERIALx_BAUD = 57 (57600).
+In main_controller.py, change the SIMULATED flag to False:
+SIMULATED = False
+
+
+
+Run the script again. It will now attempt to connect to the real flight controller.
+IMPORTANT: This project relies on ArduPilot's GUIDED_NOGPS mode for visual navigation. You must have this mode enabled in your flight controller's firmware.

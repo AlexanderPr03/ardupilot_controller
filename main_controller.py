@@ -1,56 +1,52 @@
-# main_controller.py
 import time
 from enum import Enum
 import numpy as np
 
 # --- THIS IS THE MAGIC SWITCH ---
-# Set this to False when ready to connect to the real drone
 SIMULATED = True
 
+# --- Mission & Control Parameters (TUNE THESE CAREFULLY!) ---
+TARGET_TAG_ID = 7  # The specific AprilTag ID the drone should look for
+STABILIZE_TIME_S = 3  # Seconds to hover and stabilize after the drop
+SEARCH_YAW_RATE_RPS = 0.3  # Rotation speed in radians/sec during search (~17 deg/s)
+
+# --- Homing Parameters ---
+FORWARD_SPEED_MS = 0.7  # Forward speed towards the tag in m/s
+DESCENT_SPEED_MS = 0.5  # Downward speed during diagonal approach in m/s
+KP_GAIN_XY = 0.004  # P-controller gain for sideways correction. START LOW!
+
+# --- Landing Parameters ---
+LANDING_AREA_THRESHOLD = 20000  # Pixel area of the tag to trigger the final landing.
+
+# --- Imports ---
 if SIMULATED:
     from mock_vehicle import connect, VehicleMode
 
-    # In simulation, we don't have a real camera
-    vision_system = None
+    vision = None
 else:
     from dronekit import connect, VehicleMode
     from vision_system import AprilTagDetector
-    from vehicle_control import send_velocity_command, land
+    # CORRECT: Import all necessary control functions
+    from vehicle_control import send_velocity_command, land, send_velocity_and_yaw_command
 
 
 # --- Mission States ---
 class MissionState(Enum):
     INITIALIZING = 1
     DROPPING = 2
-    SEARCHING = 3
-    HOMING = 4
-    LANDING = 5
-    DONE = 6
-
-
-# --- Control Parameters ---
-# P-controller gain for centering the tag. Tune this value carefully!
-# A larger value means more aggressive corrections.
-KP_GAIN = 0.005
-
-# Forward speed when homing towards the tag (m/s)
-FORWARD_SPEED = 0.5
-
-# The area of the tag (in pixels) at which we start the landing sequence.
-# This needs to be tuned based on camera resolution and desired landing height.
-LANDING_AREA_THRESHOLD = 15000
+    STABILIZING = 3  # NEW: State to recover from the drop
+    SEARCHING = 4
+    HOMING = 5
+    LANDING = 6
+    DONE = 7
 
 
 def run_mission():
     """Main function to run the drone's mission state machine."""
     current_state = MissionState.INITIALIZING
-
-    # Initialize connection to the vehicle
     connection_string = '/dev/serial0' if not SIMULATED else 'tcp:127.0.0.1:5760'
-    print(f"Connecting to vehicle on: {connection_string}")
     vehicle = connect(connection_string, wait_ready=True, baud=57600)
 
-    # Initialize vision system if not in simulation
     if not SIMULATED:
         vision = AprilTagDetector()
 
@@ -61,89 +57,73 @@ def run_mission():
             if current_state == MissionState.INITIALIZING:
                 vehicle.mode = VehicleMode("GUIDED_NOGPS")
                 if vehicle.arm():
-                    time.sleep(1)
                     current_state = MissionState.DROPPING
                 else:
                     print("Arming failed. Exiting.")
                     current_state = MissionState.DONE
 
             elif current_state == MissionState.DROPPING:
-                print("Simulating 2-second drop and stabilization...")
-                time.sleep(2)
+                print("Simulating 1-second freefall...")
+                time.sleep(1)
+                current_state = MissionState.STABILIZING
+
+            elif current_state == MissionState.STABILIZING:
+                print(f"Stabilizing for {STABILIZE_TIME_S} seconds...")
+                if not SIMULATED:
+                    # CORRECT: Command a hover to achieve level flight
+                    send_velocity_command(vehicle, 0, 0, 0)
+                time.sleep(STABILIZE_TIME_S)
                 current_state = MissionState.SEARCHING
 
             elif current_state == MissionState.SEARCHING:
-
                 if SIMULATED:
-
-                    print("SIM: Pretending to find a tag after 3 seconds.")
-
-                    time.sleep(3)
-
+                    print(f"SIM: Pretending to find tag ID {TARGET_TAG_ID}...")
+                    time.sleep(2)
                     current_state = MissionState.HOMING
-
                 else:
-
-                    frame, tag = vision.detect()
-
+                    # CORRECT: Pass the specific tag ID to the vision system
+                    frame, tag = vision.detect(target_tag_id=TARGET_TAG_ID)
                     if tag is not None:
-
-                        print(f"AprilTag found! ID: {tag.tag_id}. Center: {tag.center}")
-
-                        # Stop rotating before homing
-
-                        send_velocity_and_yaw_command(vehicle, 0, 0, 0, 0)
-
+                        print(f"Target AprilTag #{tag.tag_id} found!")
+                        send_velocity_and_yaw_command(vehicle, 0, 0, 0, 0)  # Stop rotating
                         current_state = MissionState.HOMING
-
                     else:
-
-                        print("No AprilTag detected. Rotating to search...")
-
-                        # FIX: Command a slow clockwise rotation (e.g., 0.3 rad/s ~ 17 deg/s)
-
-                        send_velocity_and_yaw_command(vehicle, 0, 0, 0, 0.3)
-
+                        print("No target tag detected. Rotating to search...")
+                        # CORRECT: Command a slow rotation to scan the area
+                        send_velocity_and_yaw_command(vehicle, 0, 0, 0, SEARCH_YAW_RATE_RPS)
                         time.sleep(0.5)
+
             elif current_state == MissionState.HOMING:
                 if SIMULATED:
-                    print("SIM: Pretending to home for 5 seconds, then landing.")
+                    print("SIM: Pretending to home for 5s, then landing.")
                     time.sleep(5)
                     current_state = MissionState.LANDING
                 else:
-                    frame, tag = vision.detect()
+                    frame, tag = vision.detect(target_tag_id=TARGET_TAG_ID)
                     if tag is None:
                         print("Tag lost! Returning to SEARCH mode.")
+                        send_velocity_command(vehicle, 0, 0, 0)  # Stop and hover
+                        time.sleep(1)
                         current_state = MissionState.SEARCHING
-                        # Stop the drone
-                        send_velocity_command(vehicle, 0, 0, 0)
                         continue
 
-                    # Calculate tag area to decide when to land
                     corners = tag.corners
                     tag_area = 0.5 * np.abs(
                         np.dot(corners[0] - corners[2], np.cross(corners[1] - corners[3], corners[0] - corners[2])))
-
-                    print(f"Homing on tag. Center: {tag.center}, Area: {tag_area:.2f}")
+                    print(f"Homing on tag. Area: {tag_area:.2f}")
 
                     if tag_area > LANDING_AREA_THRESHOLD:
-                        print("Tag is close enough. Proceeding to LAND.")
+                        print("Tag is close. Proceeding to LAND.")
+                        send_velocity_command(vehicle, 0, 0, 0)
                         current_state = MissionState.LANDING
-                        send_velocity_command(vehicle, 0, 0, 0)  # Stop movement
                     else:
-                        # --- Simple Proportional Controller for Centering ---
-                        # Calculate error in pixels from the center of the camera frame
                         error_x = tag.center[0] - vision.camera_center_x
-                        error_y = tag.center[1] - vision.camera_center_y
+                        vel_y = -KP_GAIN_XY * error_x
 
-                        # Calculate velocity commands (Y for left/right, Z for up/down)
-                        # The signs depend on your camera orientation. This is a common setup.
-                        vel_y = -KP_GAIN * error_x  # Move right for negative error (tag is left)
-                        vel_z = KP_GAIN * error_y  # Move up for negative error (tag is high)
-
-                        # Command the drone to move
-                        send_velocity_command(vehicle, FORWARD_SPEED, vel_y, vel_z)
-                        time.sleep(0.1)  # Loop at 10Hz
+                        # CORRECT: Command forward and constant downward speed for a true diagonal approach
+                        print(f"ErrorX: {error_x:.2f}, VelY: {vel_y:.2f}. Approaching diagonally.")
+                        send_velocity_command(vehicle, FORWARD_SPEED_MS, vel_y, DESCENT_SPEED_MS)
+                        time.sleep(0.1)
 
             elif current_state == MissionState.LANDING:
                 if not SIMULATED:
@@ -154,19 +134,14 @@ def run_mission():
     except KeyboardInterrupt:
         print("\nMission interrupted by user.")
     finally:
-        # Clean up
-        if not SIMULATED and 'vision' in locals():
+        if vehicle and vehicle.armed and not SIMULATED:
+            print("EMERGENCY: Sending stop and land command.")
+            send_velocity_command(vehicle, 0, 0, 0)
+            land(vehicle)
+        if vehicle:
+            vehicle.close()
+        if not SIMULATED and vision:
             vision.shutdown()
-
-        # Stop any movement and disarm before closing
-        if vehicle.armed:
-            if not SIMULATED:
-                send_velocity_command(vehicle, 0, 0, 0)
-                vehicle.mode = VehicleMode("LAND")
-            print("Disarming vehicle.")
-            vehicle.armed = False  # This might not work on a real vehicle, mode change is better
-
-        vehicle.close()
         print("\nMission finished. Resources cleaned up.")
 
 
